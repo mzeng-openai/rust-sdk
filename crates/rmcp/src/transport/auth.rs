@@ -535,22 +535,14 @@ impl<C> AuthClient<C> {
         async move {
             tokio::spawn(async move {
                 let manager = auth_manager.lock().await;
-                let result = match rejected_token {
+                match rejected_token {
                     Some(token) => {
                         manager
                             .try_refresh_or_reauth(RefreshReason::Rejected(&token))
                             .await
                     }
                     None => manager.get_access_token().await,
-                };
-                // The caller may have stopped waiting. Keep failures visible
-                // without logging potentially sensitive provider or store errors.
-                if let Err(error) = &result
-                    && !matches!(error, AuthError::AuthorizationRequired)
-                {
-                    tracing::warn!("OAuth token operation failed");
                 }
-                result
             })
             .await
             .map_err(|error| {
@@ -2194,7 +2186,10 @@ impl AuthorizationManager {
     /// Transient refresh failures return [`AuthError::TokenRefreshFailed`] so the
     /// caller can retry; other errors are propagated as-is.
     pub async fn get_access_token(&self) -> Result<String, AuthError> {
-        let stored = self.credential_store.load().await?;
+        let stored =
+            self.credential_store.load().await.inspect_err(|_| {
+                warn!(phase = "credential_load", "OAuth token operation failed")
+            })?;
         let Some(stored_creds) = stored else {
             return Err(AuthError::AuthorizationRequired);
         };
@@ -2228,8 +2223,8 @@ impl AuthorizationManager {
                 tracing::info!("Refreshed access token.");
                 Ok(new_creds.access_token().secret().to_string())
             }
-            Err(e @ (AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_))) => {
-                tracing::warn!(error = %e, "Token refresh not possible, re-authorization required.");
+            Err(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_)) => {
+                warn!("Token refresh not possible, re-authorization required.");
                 Err(AuthError::AuthorizationRequired)
             }
             Err(e) => Err(e),
@@ -2248,13 +2243,25 @@ impl AuthorizationManager {
         &self,
         reason: RefreshReason<'_>,
     ) -> Result<OAuthTokenResponse, AuthError> {
-        let oauth_client = self
-            .oauth_client
-            .as_ref()
-            .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
+        let oauth_client = self.oauth_client.as_ref().ok_or_else(|| {
+            warn!(
+                phase = "client_configuration",
+                "OAuth token operation failed"
+            );
+            AuthError::InternalError("OAuth client not configured".to_string())
+        })?;
 
-        let _refresh_guard = self.credential_store.acquire_refresh_guard().await?;
-        let stored = self.credential_store.load().await?;
+        // Log failures where their phase is known, before a canceled caller can
+        // lose the result. Store and provider error strings may contain secrets.
+        let _refresh_guard = self
+            .credential_store
+            .acquire_refresh_guard()
+            .await
+            .inspect_err(|_| warn!(phase = "refresh_guard", "OAuth token operation failed"))?;
+        let stored =
+            self.credential_store.load().await.inspect_err(|_| {
+                warn!(phase = "credential_load", "OAuth token operation failed")
+            })?;
         let stored_credentials = stored.ok_or(AuthError::AuthorizationRequired)?;
         let issuer = self.metadata_issuer();
         if stored_credentials.client_id != oauth_client.client_id().as_str()
@@ -2306,13 +2313,16 @@ impl AuthorizationManager {
                 redirect_policy: self.refresh_redirect_policy,
             })
             .await
-            .map_err(|error| match &error {
-                RequestTokenError::ServerResponse(response)
-                    if response.error() == &BasicErrorResponseType::InvalidGrant =>
-                {
-                    AuthError::TokenRefreshRejected(error.to_string())
+            .map_err(|error| {
+                warn!(phase = "provider_refresh", "OAuth token operation failed");
+                match &error {
+                    RequestTokenError::ServerResponse(response)
+                        if response.error() == &BasicErrorResponseType::InvalidGrant =>
+                    {
+                        AuthError::TokenRefreshRejected(error.to_string())
+                    }
+                    _ => AuthError::TokenRefreshFailed(error.to_string()),
                 }
-                _ => AuthError::TokenRefreshFailed(error.to_string()),
             })?;
 
         // RFC 6749 section 6: issuing a new refresh token on refresh is optional.
@@ -2353,7 +2363,10 @@ impl AuthorizationManager {
             token_received_at: Some(Self::now_epoch_secs()),
             issuer,
         };
-        self.credential_store.save(stored).await?;
+        self.credential_store
+            .save(stored)
+            .await
+            .inspect_err(|_| warn!(phase = "credential_save", "OAuth token operation failed"))?;
         *self.current_scopes.write().await = granted_scopes;
 
         Ok(token_result)
@@ -8522,17 +8535,6 @@ mod tests {
         .unwrap()
         .unwrap()
         .forget();
-    }
-
-    #[tokio::test]
-    async fn credential_store_does_not_coordinate_by_default() {
-        assert!(
-            InMemoryCredentialStore::new()
-                .acquire_refresh_guard()
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test]

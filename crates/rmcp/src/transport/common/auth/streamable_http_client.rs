@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use http::{HeaderName, HeaderValue};
-use tracing::debug;
 
 use crate::transport::{
     auth::{AuthClient, AuthError},
@@ -50,11 +49,10 @@ where
                 let refreshed = self.access_token_task(Some(sent_token.clone())).await;
                 match refreshed {
                     Ok(fresh_token) if fresh_token != sent_token => call(Some(fresh_token)).await,
-                    Ok(_) => Err(StreamableHttpError::AuthRequired(challenge)),
-                    Err(error) => {
-                        debug!("token refresh after server rejection failed: {error}");
+                    Ok(_) | Err(AuthError::AuthorizationRequired) => {
                         Err(StreamableHttpError::AuthRequired(challenge))
                     }
+                    Err(error) => Err(error.into()),
                 }
             }
             result => result,
@@ -232,10 +230,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn delayed_unauthorized_response_reuses_a_newer_token() {
-        let store = InMemoryCredentialStore::new();
-        store.save(credentials("old-token")).await.unwrap();
+    async fn auth_client(store: impl CredentialStore + 'static) -> AuthClient<reqwest::Client> {
         let mut manager = AuthorizationManager::new("http://localhost").await.unwrap();
         manager.set_metadata(AuthorizationMetadata {
             authorization_endpoint: "http://localhost/authorize".into(),
@@ -243,8 +238,15 @@ mod tests {
             ..Default::default()
         });
         manager.configure_client_id("client").unwrap();
-        manager.set_credential_store(store.clone());
-        let client = AuthClient::new(reqwest::Client::new(), manager);
+        manager.set_credential_store(store);
+        AuthClient::new(reqwest::Client::new(), manager)
+    }
+
+    #[tokio::test]
+    async fn delayed_unauthorized_response_reuses_a_newer_token() {
+        let store = InMemoryCredentialStore::new();
+        store.save(credentials("old-token")).await.unwrap();
+        let client = auth_client(store.clone()).await;
 
         client
             .call_reacting_to_challenges(None, |token| {
@@ -266,5 +268,50 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reactive_refresh_preserves_credential_guard_failure() {
+        struct UnavailableGuardStore;
+
+        #[async_trait::async_trait]
+        impl CredentialStore for UnavailableGuardStore {
+            async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+                unreachable!("guard failure must stop the credential reload")
+            }
+
+            async fn save(&self, _: StoredCredentials) -> Result<(), AuthError> {
+                unreachable!("guard failure must stop the credential save")
+            }
+
+            async fn clear(&self) -> Result<(), AuthError> {
+                unreachable!("refresh must not clear credentials")
+            }
+
+            async fn acquire_refresh_guard(
+                &self,
+            ) -> Result<Option<crate::transport::auth::CredentialRefreshGuard>, AuthError>
+            {
+                Err(AuthError::InternalError(
+                    "credential guard unavailable".into(),
+                ))
+            }
+        }
+
+        let client = auth_client(UnavailableGuardStore).await;
+        let error = client
+            .call_reacting_to_challenges(Some("old-token".into()), |_| async {
+                Err::<(), _>(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                    "Bearer".into(),
+                )))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StreamableHttpError::Auth(AuthError::InternalError(message))
+                if message == "credential guard unavailable"
+        ));
     }
 }
