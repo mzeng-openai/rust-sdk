@@ -47,10 +47,7 @@ where
                 let Some(sent_token) = auth_token else {
                     return Err(StreamableHttpError::AuthRequired(challenge));
                 };
-                let refreshed = {
-                    let manager = self.auth_manager.lock().await;
-                    manager.try_refresh_or_reauth().await
-                };
+                let refreshed = self.access_token_task(Some(sent_token.clone())).await;
                 match refreshed {
                     Ok(fresh_token) if fresh_token != sent_token => call(Some(fresh_token)).await,
                     Ok(_) => Err(StreamableHttpError::AuthRequired(challenge)),
@@ -206,5 +203,68 @@ where
             }
         })
         .await
+    }
+}
+
+#[cfg(all(test, feature = "transport-streamable-http-client-reqwest"))]
+mod tests {
+    use super::*;
+    use crate::transport::{
+        auth::{
+            AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
+            StoredCredentials,
+        },
+        streamable_http_client::AuthRequiredError,
+    };
+
+    fn credentials(access_token: &str) -> StoredCredentials {
+        StoredCredentials::new(
+            "client".into(),
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "access_token": access_token,
+                    "token_type": "Bearer",
+                }))
+                .unwrap(),
+            ),
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn delayed_unauthorized_response_reuses_a_newer_token() {
+        let store = InMemoryCredentialStore::new();
+        store.save(credentials("old-token")).await.unwrap();
+        let mut manager = AuthorizationManager::new("http://localhost").await.unwrap();
+        manager.set_metadata(AuthorizationMetadata {
+            authorization_endpoint: "http://localhost/authorize".into(),
+            token_endpoint: "http://localhost/token".into(),
+            ..Default::default()
+        });
+        manager.configure_client_id("client").unwrap();
+        manager.set_credential_store(store.clone());
+        let client = AuthClient::new(reqwest::Client::new(), manager);
+
+        client
+            .call_reacting_to_challenges(None, |token| {
+                let store = store.clone();
+                async move {
+                    match token.as_deref() {
+                        Some("old-token") => {
+                            // Another request saves a fresh token before this
+                            // request's challenge reaches the authorization manager.
+                            store.save(credentials("new-token")).await.unwrap();
+                            Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                                "Bearer".into(),
+                            )))
+                        }
+                        Some("new-token") => Ok(()),
+                        unexpected => panic!("unexpected token: {unexpected:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
     }
 }
