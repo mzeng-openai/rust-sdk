@@ -255,18 +255,17 @@ impl StoredCredentials {
     }
 }
 
-/// An owned guard that coordinates a credential refresh until it is dropped.
+/// An owned guard held across a credential refresh and its save.
 ///
-/// Credential stores can wrap a file lock, an owned mutex guard, or another
-/// coordination primitive. The manager retains it while reloading credentials,
-/// refreshing the token, and saving the result.
+/// Stores can wrap a file lock, an owned mutex guard, or another coordination
+/// primitive. Dropping this value releases the guard.
 #[must_use = "dropping the guard releases refresh coordination"]
 pub struct CredentialRefreshGuard {
     _guard: Box<dyn Send>,
 }
 
 impl CredentialRefreshGuard {
-    /// Wrap a guard whose lifetime controls access to the shared credentials.
+    /// Wrap a guard whose lifetime coordinates access to the stored credentials.
     pub fn new(guard: impl Send + 'static) -> Self {
         Self {
             _guard: Box::new(guard),
@@ -279,6 +278,8 @@ impl CredentialRefreshGuard {
 /// Implementations of this trait can provide custom storage backends
 /// for OAuth2 credentials, such as file-based storage, keychain integration,
 /// or database storage.
+/// Return [`AuthError::CredentialStoreError`] for backend or locking failures
+/// so they remain distinct from errors requiring reauthorization.
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError>;
@@ -287,15 +288,12 @@ pub trait CredentialStore: Send + Sync {
 
     async fn clear(&self) -> Result<(), AuthError>;
 
-    /// Optionally serialize coordinated refreshes across clients sharing these credentials.
+    /// Optionally serialize refreshes that share these credentials.
     ///
-    /// The manager loads the authoritative credentials after acquiring this
-    /// guard and retains it through the token request and durable save.
-    /// Implementations must not reacquire the same lock in `load` or `save`.
-    /// Other credential writers, including login and logout, must use the same
-    /// lock. Implementations should bound the time spent waiting for the lock.
-    /// The default implementation does not coordinate refreshes. Managers in
-    /// [`OAuthRefreshMode::Legacy`] do not call this hook.
+    /// The manager acquires this guard before loading credentials and retains it
+    /// through the token request and save. `load` and `save` must not reacquire
+    /// the same lock. Writers that bypass the guard are not serialized with it.
+    /// The default does not coordinate refreshes.
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
         Ok(None)
     }
@@ -490,30 +488,12 @@ impl StateStore for InMemoryStateStore {
     }
 }
 
-/// Selects how OAuth refreshes interact with credential storage and caller cancellation.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OAuthRefreshMode {
-    /// Preserve the original refresh behavior without acquiring a store guard.
-    #[default]
-    Legacy,
-    /// Reload and save under the store guard, retaining automatic refreshes
-    /// when their caller stops waiting.
-    Coordinated,
-}
-
-/// HTTP client with OAuth 2.0 authorization.
-///
-/// In [`OAuthRefreshMode::Coordinated`], automatic token refresh runs in a
-/// separate Tokio task so that dropping a request does not cancel an in-progress
-/// refresh or credential save. Runtime shutdown can still interrupt this work.
-/// Credential stores and HTTP clients should apply their own operation timeouts.
+/// HTTP client with OAuth 2.0 authorization
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AuthClient<C> {
     pub http_client: C,
     pub auth_manager: Arc<Mutex<AuthorizationManager>>,
-    pub(super) refresh_mode: OAuthRefreshMode,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for AuthClient<C> {
@@ -521,7 +501,6 @@ impl<C: std::fmt::Debug> std::fmt::Debug for AuthClient<C> {
         f.debug_struct("AuthorizedClient")
             .field("http_client", &self.http_client)
             .field("auth_manager", &"...")
-            .field("refresh_mode", &self.refresh_mode)
             .finish()
     }
 }
@@ -529,48 +508,17 @@ impl<C: std::fmt::Debug> std::fmt::Debug for AuthClient<C> {
 impl<C> AuthClient<C> {
     /// Create a new authorized HTTP client
     pub fn new(http_client: C, auth_manager: AuthorizationManager) -> Self {
-        let refresh_mode = auth_manager.refresh_mode;
         Self {
             http_client,
             auth_manager: Arc::new(Mutex::new(auth_manager)),
-            refresh_mode,
         }
     }
 }
 
 impl<C> AuthClient<C> {
-    /// Get a token using the manager's configured refresh mode.
     pub fn get_access_token(&self) -> impl Future<Output = Result<String, AuthError>> + Send {
-        self.access_token_for(None)
-    }
-
-    pub(crate) fn access_token_for(
-        &self,
-        rejected_token: Option<String>,
-    ) -> impl Future<Output = Result<String, AuthError>> + Send {
         let auth_manager = self.auth_manager.clone();
-        let refresh_mode = self.refresh_mode;
-        async move {
-            let operation = async move {
-                let manager = auth_manager.lock().await;
-                match rejected_token {
-                    Some(token) => {
-                        manager
-                            .try_refresh_or_reauth(RefreshReason::Rejected(&token))
-                            .await
-                    }
-                    None => manager.get_access_token().await,
-                }
-            };
-            match refresh_mode {
-                OAuthRefreshMode::Legacy => operation.await,
-                OAuthRefreshMode::Coordinated => {
-                    tokio::spawn(operation).await.map_err(|error| {
-                        AuthError::InternalError(format!("OAuth token task failed: {error}"))
-                    })?
-                }
-            }
-        }
+        async move { auth_manager.lock().await.get_access_token().await }
     }
 }
 
@@ -596,6 +544,9 @@ pub enum AuthError {
     /// The authorization server definitively rejected the refresh token.
     #[error("OAuth refresh token was rejected: {0}")]
     TokenRefreshRejected(String),
+
+    #[error("OAuth credential store failed: {0}")]
+    CredentialStoreError(String),
 
     #[error("HTTP error: {0}")]
     HttpError(#[from] reqwest::Error),
@@ -1102,7 +1053,6 @@ pub struct AuthorizationManager {
     metadata: Option<AuthorizationMetadata>,
     oauth_client: Option<OAuthClient>,
     credential_store: Arc<dyn CredentialStore>,
-    refresh_mode: OAuthRefreshMode,
     state_store: Arc<dyn StateStore>,
     base_url: Url,
     current_scopes: RwLock<Vec<String>>,
@@ -1117,12 +1067,6 @@ pub struct AuthorizationManager {
     /// OIDC Dynamic Client Registration `application_type` (SEP-837)
     application_type: Option<String>,
     allow_missing_issuer: bool,
-}
-
-enum RefreshReason<'a> {
-    Explicit,
-    Expiring,
-    Rejected(&'a str),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1360,7 +1304,6 @@ impl AuthorizationManager {
             metadata: None,
             oauth_client: None,
             credential_store: Arc::new(InMemoryCredentialStore::new()),
-            refresh_mode: OAuthRefreshMode::default(),
             state_store: Arc::new(InMemoryStateStore::new()),
             base_url,
             current_scopes: RwLock::new(Vec::new()),
@@ -1374,16 +1317,6 @@ impl AuthorizationManager {
         };
 
         Ok(manager)
-    }
-
-    /// Select refresh behavior before wrapping this manager in an [`AuthClient`].
-    ///
-    /// The default is [`OAuthRefreshMode::Legacy`]. Coordinated mode uses the
-    /// credential store's optional guard and keeps automatic refreshes alive
-    /// after caller cancellation. Direct manager futures remain cancellable.
-    pub fn with_refresh_mode(mut self, mode: OAuthRefreshMode) -> Self {
-        self.refresh_mode = mode;
-        self
     }
 
     /// Set the scope upgrade configuration
@@ -2205,19 +2138,6 @@ impl AuthorizationManager {
     /// to avoid races between token retrieval and the actual HTTP request.
     const REFRESH_BUFFER_SECS: u64 = 30;
 
-    fn remaining_token_lifetime_secs(credentials: &StoredCredentials) -> Option<u64> {
-        let expires_in = credentials.token_response.as_ref()?.expires_in()?;
-        let received_at = credentials.token_received_at?;
-        let elapsed = Self::now_epoch_secs().saturating_sub(received_at);
-        Some(expires_in.as_secs().saturating_sub(elapsed))
-    }
-
-    fn warn_token_operation_failed(&self, phase: &'static str) {
-        if self.refresh_mode == OAuthRefreshMode::Coordinated {
-            warn!(phase, "OAuth token operation failed");
-        }
-    }
-
     /// Get access token from local credential store.
     /// If expired, refresh it automatically when a refresh token is available.
     /// When the access token has expired and no refresh token is available, or the
@@ -2226,11 +2146,7 @@ impl AuthorizationManager {
     /// Transient refresh failures return [`AuthError::TokenRefreshFailed`] so the
     /// caller can retry; other errors are propagated as-is.
     pub async fn get_access_token(&self) -> Result<String, AuthError> {
-        let stored = self
-            .credential_store
-            .load()
-            .await
-            .inspect_err(|_| self.warn_token_operation_failed("credential_load"))?;
+        let stored = self.credential_store.load().await?;
         let Some(stored_creds) = stored else {
             return Err(AuthError::AuthorizationRequired);
         };
@@ -2238,14 +2154,19 @@ impl AuthorizationManager {
             return Err(AuthError::AuthorizationRequired);
         };
 
-        if let Some(remaining) = Self::remaining_token_lifetime_secs(&stored_creds)
-            && remaining < Self::REFRESH_BUFFER_SECS
+        if let (Some(expires_in), Some(received_at)) =
+            (creds.expires_in(), stored_creds.token_received_at)
         {
-            tracing::info!(
-                remaining_secs = remaining,
-                "Access token expired or nearly expired, refreshing."
-            );
-            return self.try_refresh_or_reauth(RefreshReason::Expiring).await;
+            let elapsed = Self::now_epoch_secs().saturating_sub(received_at);
+            let remaining = expires_in.as_secs().saturating_sub(elapsed);
+
+            if remaining < Self::REFRESH_BUFFER_SECS {
+                tracing::info!(
+                    remaining_secs = remaining,
+                    "Access token expired or nearly expired, refreshing."
+                );
+                return self.try_refresh_or_reauth().await;
+            }
         }
 
         // When expiry info is unavailable (e.g., credentials stored before
@@ -2258,86 +2179,38 @@ impl AuthorizationManager {
     /// refresh token or the server rejected it, return `AuthorizationRequired`
     /// so the caller can re-prompt the user. Infrastructure errors (e.g. store
     /// I/O failures, misconfigured client) are propagated as-is.
-    async fn try_refresh_or_reauth(&self, reason: RefreshReason<'_>) -> Result<String, AuthError> {
-        match self.refresh_token_for(reason).await {
+    pub(crate) async fn try_refresh_or_reauth(&self) -> Result<String, AuthError> {
+        match self.refresh_token().await {
             Ok(new_creds) => {
                 tracing::info!("Refreshed access token.");
                 Ok(new_creds.access_token().secret().to_string())
             }
-            Err(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_)) => {
-                warn!("Token refresh not possible, re-authorization required.");
+            Err(e @ (AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_))) => {
+                tracing::warn!(error = %e, "Token refresh not possible, re-authorization required.");
                 Err(AuthError::AuthorizationRequired)
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Explicitly refresh the access token using the configured refresh mode.
-    ///
-    /// Cancelling this future cancels the refresh, including any pending save.
-    /// [`AuthClient`] keeps automatic refreshes alive in coordinated mode when
-    /// a request is dropped.
+    /// refresh access token
     pub async fn refresh_token(&self) -> Result<OAuthTokenResponse, AuthError> {
-        self.refresh_token_for(RefreshReason::Explicit).await
-    }
+        let oauth_client = self
+            .oauth_client
+            .as_ref()
+            .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
 
-    async fn refresh_token_for(
-        &self,
-        reason: RefreshReason<'_>,
-    ) -> Result<OAuthTokenResponse, AuthError> {
-        let coordinated = self.refresh_mode == OAuthRefreshMode::Coordinated;
-        let oauth_client = self.oauth_client.as_ref().ok_or_else(|| {
-            self.warn_token_operation_failed("client_configuration");
-            AuthError::InternalError("OAuth client not configured".to_string())
-        })?;
-
-        // Log failures where their phase is known, before a canceled caller can
-        // lose the result. Store and provider error strings may contain secrets.
-        let _refresh_guard = if coordinated {
-            self.credential_store
-                .acquire_refresh_guard()
-                .await
-                .inspect_err(|_| self.warn_token_operation_failed("refresh_guard"))?
-        } else {
-            None
-        };
-        let stored = self
-            .credential_store
-            .load()
-            .await
-            .inspect_err(|_| self.warn_token_operation_failed("credential_load"))?;
+        let refresh_guard = self.credential_store.acquire_refresh_guard().await?;
+        let stored = self.credential_store.load().await?;
         let stored_credentials = stored.ok_or(AuthError::AuthorizationRequired)?;
-        let issuer = self.metadata_issuer();
-        if coordinated
-            && (stored_credentials.client_id != oauth_client.client_id().as_str()
-                || stored_credentials
-                    .issuer
-                    .as_ref()
-                    .is_some_and(|stored_issuer| Some(stored_issuer) != issuer.as_ref()))
+        if refresh_guard.is_some()
+            && stored_credentials.client_id != oauth_client.client_id().as_str()
         {
-            // Rebuild the manager rather than sending a replacement grant to
-            // an OAuth client configured for a different registration or issuer.
             return Err(AuthError::AuthorizationRequired);
         }
-        let access_token_is_fresh = coordinated
-            && Self::remaining_token_lifetime_secs(&stored_credentials)
-                .is_none_or(|remaining| remaining >= Self::REFRESH_BUFFER_SECS);
         let current_credentials = stored_credentials
             .token_response
             .ok_or(AuthError::AuthorizationRequired)?;
-
-        let can_reuse = coordinated
-            && match reason {
-                RefreshReason::Explicit => false,
-                RefreshReason::Expiring => access_token_is_fresh,
-                RefreshReason::Rejected(rejected) => {
-                    access_token_is_fresh && current_credentials.access_token().secret() != rejected
-                }
-            };
-        if can_reuse {
-            *self.current_scopes.write().await = stored_credentials.granted_scopes;
-            return Ok(current_credentials);
-        }
 
         let refresh_token = current_credentials
             .refresh_token()
@@ -2349,7 +2222,8 @@ impl AuthorizationManager {
             .exchange_refresh_token(&refresh_token_value)
             // RFC 8707: the resource indicator is required on token requests, including refreshes
             .add_extra_param("resource", self.oauth_resource().await);
-        let mut refresh_scopes = stored_credentials.granted_scopes.clone();
+        let mut refresh_scopes = stored_credentials.granted_scopes;
+        let authoritative_scopes = refresh_guard.is_some().then(|| refresh_scopes.clone());
         self.add_offline_access_if_supported(&mut refresh_scopes);
         for scope in refresh_scopes {
             refresh_request = refresh_request.add_scope(Scope::new(scope));
@@ -2360,16 +2234,13 @@ impl AuthorizationManager {
                 redirect_policy: self.refresh_redirect_policy,
             })
             .await
-            .map_err(|error| {
-                self.warn_token_operation_failed("provider_refresh");
-                match &error {
-                    RequestTokenError::ServerResponse(response)
-                        if response.error() == &BasicErrorResponseType::InvalidGrant =>
-                    {
-                        AuthError::TokenRefreshRejected(error.to_string())
-                    }
-                    _ => AuthError::TokenRefreshFailed(error.to_string()),
+            .map_err(|error| match &error {
+                RequestTokenError::ServerResponse(response)
+                    if response.error() == &BasicErrorResponseType::InvalidGrant =>
+                {
+                    AuthError::TokenRefreshRejected(error.to_string())
                 }
+                _ => AuthError::TokenRefreshFailed(error.to_string()),
             })?;
 
         // RFC 6749 section 6: issuing a new refresh token on refresh is optional.
@@ -2379,49 +2250,23 @@ impl AuthorizationManager {
             token_result.set_refresh_token(Some(refresh_token_value));
         }
 
-        // An omitted scope retains the authoritative grant, including in the
-        // token response used by stores that persist only that response.
-        if coordinated && token_result.scopes().is_none() {
-            let scopes = if stored_credentials.granted_scopes.is_empty() {
-                current_credentials.scopes().cloned()
-            } else {
-                Some(
-                    stored_credentials
-                        .granted_scopes
-                        .iter()
-                        .cloned()
-                        .map(Scope::new)
-                        .collect(),
-                )
-            };
-            token_result.set_scopes(scopes);
-        }
-
-        let granted_scopes: Vec<String> = match token_result.scopes() {
-            Some(scopes) => scopes.iter().map(|s| s.to_string()).collect(),
-            None if coordinated => stored_credentials.granted_scopes,
-            None => self.current_scopes.read().await.clone(),
+        let granted_scopes: Vec<String> = match (token_result.scopes(), authoritative_scopes) {
+            (Some(scopes), _) => scopes.iter().map(|s| s.to_string()).collect(),
+            (None, Some(scopes)) => scopes,
+            (None, None) => self.current_scopes.read().await.clone(),
         };
 
-        if !coordinated {
-            *self.current_scopes.write().await = granted_scopes.clone();
-        }
+        *self.current_scopes.write().await = granted_scopes.clone();
 
         let client_id = oauth_client.client_id().to_string();
         let stored = StoredCredentials {
             client_id,
             token_response: Some(token_result.clone()),
-            granted_scopes: granted_scopes.clone(),
+            granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
-            issuer,
+            issuer: self.metadata_issuer(),
         };
-        self.credential_store
-            .save(stored)
-            .await
-            .inspect_err(|_| self.warn_token_operation_failed("credential_save"))?;
-        if coordinated {
-            *self.current_scopes.write().await = granted_scopes;
-        }
+        self.credential_store.save(stored).await?;
 
         Ok(token_result)
     }
@@ -4067,15 +3912,16 @@ mod tests {
     use oauth2::{AuthType, CsrfToken, HttpResponse, PkceCodeVerifier, TokenResponse};
     use reqwest::StatusCode;
     use rstest::rstest;
+    use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
     use url::Url;
 
     use super::{
-        AuthClient, AuthError, AuthorizationCallback, AuthorizationManager, AuthorizationMetadata,
+        AuthError, AuthorizationCallback, AuthorizationManager, AuthorizationMetadata,
         AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession,
         CredentialRefreshGuard, CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
         OAuthClientConfig, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
-        OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthRefreshMode, RefreshReason,
-        ScopeUpgradeConfig, StateStore, StoredAuthorizationState, is_https_url,
+        OAuthHttpRedirectPolicy, OAuthHttpRequest, ScopeUpgradeConfig, StateStore,
+        StoredAuthorizationState, is_https_url,
     };
     use crate::transport::auth::VendorExtraTokenFields;
 
@@ -7959,10 +7805,7 @@ mod tests {
     async fn invalid_grant_refresh_requires_reauthorization() {
         let manager = manager_with_refresh_error("invalid_grant").await;
 
-        let err = manager
-            .try_refresh_or_reauth(RefreshReason::Explicit)
-            .await
-            .unwrap_err();
+        let err = manager.try_refresh_or_reauth().await.unwrap_err();
 
         assert!(
             matches!(err, AuthError::AuthorizationRequired),
@@ -7974,10 +7817,7 @@ mod tests {
     async fn temporary_refresh_failure_does_not_require_reauthorization() {
         let manager = manager_with_refresh_error("temporarily_unavailable").await;
 
-        let err = manager
-            .try_refresh_or_reauth(RefreshReason::Explicit)
-            .await
-            .unwrap_err();
+        let err = manager.try_refresh_or_reauth().await.unwrap_err();
 
         assert!(
             matches!(err, AuthError::TokenRefreshFailed(_)),
@@ -8477,35 +8317,49 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct CoordinatedCredentialStore {
+    struct RefreshStore {
         credentials: InMemoryCredentialStore,
-        refresh_lock: Arc<tokio::sync::Mutex<()>>,
-        guard_attempts: Arc<tokio::sync::Semaphore>,
-        save_started: Arc<tokio::sync::Semaphore>,
-        save_gate: Option<Arc<tokio::sync::Semaphore>>,
-        fail_guard: bool,
-        fail_save: bool,
+        lock: Arc<Mutex<()>>,
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        guard_requested: Arc<Semaphore>,
+        save_started: Arc<Semaphore>,
+        save_gate: Option<Arc<Semaphore>>,
+        fail_at: Option<&'static str>,
+    }
+
+    struct ObservedRefreshGuard {
+        _lock: OwnedMutexGuard<()>,
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for ObservedRefreshGuard {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("release");
+        }
     }
 
     #[async_trait::async_trait]
-    impl CredentialStore for CoordinatedCredentialStore {
+    impl CredentialStore for RefreshStore {
         async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+            self.events.lock().unwrap().push("load");
+            if self.fail_at == Some("load") {
+                return Err(AuthError::CredentialStoreError("load failed".into()));
+            }
             self.credentials.load().await
         }
 
         async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-            assert!(
-                self.refresh_lock.try_lock().is_err(),
-                "save must hold the guard"
-            );
+            self.events.lock().unwrap().push("save");
             self.save_started.add_permits(1);
             if let Some(gate) = &self.save_gate {
                 gate.acquire().await.unwrap().forget();
             }
-            if self.fail_save {
-                return Err(AuthError::InternalError("save failed".into()));
+            if self.fail_at == Some("save") {
+                return Err(AuthError::CredentialStoreError("save failed".into()));
             }
-            self.credentials.save(credentials).await
+            self.credentials.save(credentials).await?;
+            self.events.lock().unwrap().push("saved");
+            Ok(())
         }
 
         async fn clear(&self) -> Result<(), AuthError> {
@@ -8513,42 +8367,78 @@ mod tests {
         }
 
         async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
-            self.guard_attempts.add_permits(1);
-            if self.fail_guard {
-                return Err(AuthError::InternalError("guard failed".into()));
+            self.events.lock().unwrap().push("acquire");
+            self.guard_requested.add_permits(1);
+            if self.fail_at == Some("guard") {
+                return Err(AuthError::CredentialStoreError("guard failed".into()));
             }
-            Ok(Some(CredentialRefreshGuard::new(
-                self.refresh_lock.clone().lock_owned().await,
-            )))
+            let lock = self.lock.clone().lock_owned().await;
+            self.events.lock().unwrap().push("acquired");
+            Ok(Some(CredentialRefreshGuard::new(ObservedRefreshGuard {
+                _lock: lock,
+                events: self.events.clone(),
+            })))
         }
     }
 
-    async fn coordinated_store() -> CoordinatedCredentialStore {
-        let store = CoordinatedCredentialStore {
-            credentials: InMemoryCredentialStore::new(),
-            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
-            guard_attempts: Arc::new(tokio::sync::Semaphore::new(0)),
-            save_started: Arc::new(tokio::sync::Semaphore::new(0)),
+    fn refresh_store() -> RefreshStore {
+        let credentials = StoredCredentials::new(
+            "my-client".into(),
+            Some(make_token_response_with_refresh("old-token", "old-refresh")),
+            vec!["read".into()],
+            Some(AuthorizationManager::now_epoch_secs()),
+        );
+        RefreshStore {
+            credentials: InMemoryCredentialStore {
+                credentials: Arc::new(tokio::sync::RwLock::new(Some(credentials))),
+            },
+            lock: Arc::new(Mutex::new(())),
+            events: Arc::new(StdMutex::new(Vec::new())),
+            guard_requested: Arc::new(Semaphore::new(0)),
+            save_started: Arc::new(Semaphore::new(0)),
             save_gate: None,
-            fail_guard: false,
-            fail_save: false,
-        };
-        store
-            .credentials
-            .save(StoredCredentials::new(
-                "my-client".into(),
-                Some(make_token_response_with_refresh("old-token", "old-refresh")),
-                vec!["read".into()],
-                Some(AuthorizationManager::now_epoch_secs() - 7200),
-            ))
-            .await
-            .unwrap();
-        store
+            fail_at: None,
+        }
+    }
+
+    struct RefreshHttpClient {
+        recording: RecordingOAuthHttpClient,
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl OAuthHttpClient for RefreshHttpClient {
+        fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+            self.events.lock().unwrap().push("provider");
+            self.recording.execute(request)
+        }
+    }
+
+    fn refresh_http_client(store: &RefreshStore) -> Arc<RefreshHttpClient> {
+        Arc::new(RefreshHttpClient {
+            recording: RecordingOAuthHttpClient::with_responses(
+                [
+                    ("new-token", "new-refresh"),
+                    ("latest-token", "latest-refresh"),
+                ]
+                .into_iter()
+                .map(|(access, refresh)| {
+                    http_response(
+                        200,
+                        serde_json::json!({
+                            "access_token": access, "token_type": "Bearer",
+                            "expires_in": 3600, "refresh_token": refresh
+                        }),
+                    )
+                })
+                .collect(),
+            ),
+            events: store.events.clone(),
+        })
     }
 
     async fn refresh_manager(
-        store: impl CredentialStore + 'static,
-        http_client: Arc<dyn OAuthHttpClient>,
+        store: RefreshStore,
+        http_client: Arc<RefreshHttpClient>,
     ) -> AuthorizationManager {
         let mut manager = AuthorizationManager::new_with_oauth_http_client(
             "https://mcp.example.com/mcp",
@@ -8559,37 +8449,15 @@ mod tests {
         manager.set_metadata(AuthorizationMetadata {
             authorization_endpoint: "https://auth.example.com/authorize".into(),
             token_endpoint: "https://auth.example.com/token".into(),
-            issuer: Some("https://auth.example.com".into()),
             ..Default::default()
         });
         manager.configure_client(test_client_config()).unwrap();
         manager.set_credential_store(store);
-        *manager.current_scopes.write().await = vec!["stale".into()];
+        *manager.current_scopes.write().await = vec!["cached".into()];
         manager
     }
 
-    async fn coordinated_manager(
-        store: CoordinatedCredentialStore,
-        http_client: Arc<dyn OAuthHttpClient>,
-    ) -> AuthorizationManager {
-        refresh_manager(store, http_client)
-            .await
-            .with_refresh_mode(OAuthRefreshMode::Coordinated)
-    }
-
-    fn refresh_http_client() -> RecordingOAuthHttpClient {
-        RecordingOAuthHttpClient::with_responses(vec![http_response(
-            200,
-            serde_json::json!({
-                "access_token": "new-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-                "refresh_token": "new-refresh",
-            }),
-        )])
-    }
-
-    async fn wait_for_permits(semaphore: &tokio::sync::Semaphore, count: u32) {
+    async fn wait_for_permits(semaphore: &Semaphore, count: u32) {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             semaphore.acquire_many(count),
@@ -8601,82 +8469,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_refresh_preserves_legacy_store_semantics() {
-        let mut store = coordinated_store().await;
-        // A legacy caller may already hold this lock around the SDK call.
-        // Failing the hook makes accidental reentry fail instead of hanging.
-        store.fail_guard = true;
-        let guard = store.refresh_lock.clone().lock_owned().await;
-        let mut credentials = store.load().await.unwrap().unwrap();
-        credentials.client_id = "replacement-client".into();
-        credentials.issuer = Some("https://replacement.example.com".into());
-        store.credentials.save(credentials).await.unwrap();
-        let http_client = refresh_http_client();
-        let manager = refresh_manager(store.clone(), Arc::new(http_client.clone())).await;
+    async fn refresh_guard_spans_load_exchange_and_completed_save() {
+        let store = refresh_store();
+        let manager = refresh_manager(store.clone(), refresh_http_client(&store)).await;
 
-        assert_eq!(manager.refresh_mode, OAuthRefreshMode::Legacy);
-        assert_eq!(manager.get_access_token().await.unwrap(), "new-token");
-        assert_eq!(store.guard_attempts.available_permits(), 0);
-        assert_eq!(http_client.requests().len(), 1);
-        let saved = store.load().await.unwrap().unwrap();
-        assert!(saved.token_response.unwrap().scopes().is_none());
-        assert_eq!(saved.granted_scopes, ["stale"]);
-        assert_eq!(*manager.current_scopes.read().await, ["stale"]);
-        drop(guard);
-    }
+        manager.refresh_token().await.unwrap();
 
-    #[tokio::test]
-    async fn default_refresh_publishes_scopes_before_a_failed_save() {
-        let mut store = coordinated_store().await;
-        store.fail_guard = true;
-        store.fail_save = true;
-        let guard = store.refresh_lock.clone().lock_owned().await;
-        let http_client = RecordingOAuthHttpClient::with_responses(vec![http_response(
-            200,
-            serde_json::json!({
-                "access_token": "new-token", "token_type": "Bearer", "scope": "updated",
-            }),
-        )]);
-        let manager = refresh_manager(store.clone(), Arc::new(http_client)).await;
-
-        assert!(matches!(
-            manager.refresh_token().await,
-            Err(AuthError::InternalError(message)) if message == "save failed"
-        ));
-        assert_eq!(*manager.current_scopes.read().await, ["updated"]);
         assert_eq!(
-            store.load().await.unwrap().unwrap().granted_scopes,
-            ["read"]
+            *store.events.lock().unwrap(),
+            [
+                "acquire", "acquired", "load", "provider", "save", "saved", "release"
+            ]
         );
-        assert_eq!(store.guard_attempts.available_permits(), 0);
-        drop(guard);
-    }
-
-    #[tokio::test]
-    async fn concurrent_expiry_refreshes_share_the_saved_credentials() {
-        let store = coordinated_store().await;
-        let http_client = refresh_http_client();
-        let first = coordinated_manager(store.clone(), Arc::new(http_client.clone())).await;
-        let second = coordinated_manager(store.clone(), Arc::new(http_client.clone())).await;
-        let guard = store.refresh_lock.clone().lock_owned().await;
-        let refreshes = tokio::spawn(async move {
-            let (first_token, second_token) =
-                tokio::join!(first.get_access_token(), second.get_access_token(),);
-            assert_eq!(first_token.unwrap(), "new-token");
-            assert_eq!(second_token.unwrap(), "new-token");
-            assert_eq!(*first.current_scopes.read().await, ["read"]);
-            assert_eq!(*second.current_scopes.read().await, ["read"]);
-        });
-        wait_for_permits(&store.guard_attempts, 2).await;
-        drop(guard);
-        tokio::time::timeout(std::time::Duration::from_secs(5), refreshes)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(http_client.requests().len(), 1);
-        let saved = store.load().await.unwrap().unwrap();
-        assert_eq!(saved.granted_scopes, ["read"]);
+        let saved = store.credentials.load().await.unwrap().unwrap();
         assert_eq!(
             saved
                 .token_response
@@ -8686,254 +8491,101 @@ mod tests {
                 .secret(),
             "new-refresh"
         );
-        assert!(store.refresh_lock.try_lock().is_ok());
+        assert_eq!(saved.granted_scopes, ["read"]);
+        assert!(store.lock.try_lock().is_ok());
     }
 
-    #[rstest]
-    #[case::fresh_replacement("replacement", Some(0), false)]
-    #[case::expired_replacement("replacement", Some(7200), true)]
-    #[case::rejected_access_with_new_refresh_token("old-token", Some(0), true)]
-    #[case::replacement_without_expiry("replacement", None, false)]
     #[tokio::test]
-    async fn reactive_refresh_reuses_only_a_usable_replacement(
-        #[case] access_token: &str,
-        #[case] age: Option<u64>,
-        #[case] should_refresh: bool,
-    ) {
-        let store = coordinated_store().await;
-        let mut credentials = store.load().await.unwrap().unwrap();
-        credentials.token_response = Some(make_token_response_with_refresh(
-            access_token,
-            "current-refresh",
-        ));
-        credentials.token_received_at = age.map(|age| AuthorizationManager::now_epoch_secs() - age);
-        store.credentials.save(credentials).await.unwrap();
-        let http_client = refresh_http_client();
-        let manager = coordinated_manager(store.clone(), Arc::new(http_client.clone())).await;
+    async fn concurrent_refreshes_wait_for_save_and_use_the_latest_token() {
+        let mut store = refresh_store();
+        let save_gate = Arc::new(Semaphore::new(0));
+        store.save_gate = Some(save_gate.clone());
+        let http_client = refresh_http_client(&store);
+        let first_manager = refresh_manager(store.clone(), http_client.clone()).await;
+        let second_manager = refresh_manager(store.clone(), http_client.clone()).await;
 
-        let token = manager
-            .try_refresh_or_reauth(RefreshReason::Rejected("old-token"))
-            .await
-            .unwrap();
+        let first = tokio::spawn(async move { first_manager.refresh_token().await });
+        wait_for_permits(&store.save_started, 1).await;
+        let second = tokio::spawn(async move { second_manager.refresh_token().await });
+        wait_for_permits(&store.guard_requested, 2).await;
+        assert_eq!(http_client.recording.requests().len(), 1);
+        assert!(store.lock.try_lock().is_err());
+
+        save_gate.add_permits(2);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().unwrap().access_token().secret(), "new-token");
         assert_eq!(
-            token,
-            if should_refresh {
-                "new-token"
-            } else {
-                access_token
-            }
+            second.unwrap().unwrap().access_token().secret(),
+            "latest-token"
         );
-        assert_eq!(http_client.requests().len(), usize::from(should_refresh));
-        assert_eq!(*manager.current_scopes.read().await, ["read"]);
-        if should_refresh {
-            let requests = http_client.requests();
-            let params: HashMap<_, _> = url::form_urlencoded::parse(&requests[0].body)
-                .into_owned()
-                .collect();
-            assert_eq!(
-                params.get("refresh_token").map(String::as_str),
-                Some("current-refresh")
-            );
-        }
+        let refresh_tokens: Vec<String> = http_client
+            .recording
+            .requests()
+            .iter()
+            .map(|request| {
+                url::form_urlencoded::parse(&request.body)
+                    .find_map(|(key, value)| (key == "refresh_token").then(|| value.into_owned()))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(refresh_tokens, ["old-refresh", "new-refresh"]);
+        let saved = store.credentials.load().await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .token_response
+                .unwrap()
+                .refresh_token()
+                .unwrap()
+                .secret(),
+            "latest-refresh"
+        );
+        assert!(store.lock.try_lock().is_ok());
     }
 
-    #[rstest]
-    #[case::deleted(None, None)]
-    #[case::new_registration(Some("new-client"), None)]
-    #[case::new_issuer(Some("my-client"), Some("https://other.example.com"))]
     #[tokio::test]
-    async fn refresh_rejects_credentials_replaced_while_waiting(
-        #[case] client_id: Option<&str>,
-        #[case] issuer: Option<&str>,
-    ) {
-        let store = coordinated_store().await;
-        let http_client = refresh_http_client();
-        let manager = coordinated_manager(store.clone(), Arc::new(http_client.clone())).await;
-        let guard = store.refresh_lock.clone().lock_owned().await;
-        let refresh = tokio::spawn(async move { manager.get_access_token().await });
-        wait_for_permits(&store.guard_attempts, 1).await;
-        if let Some(client_id) = client_id {
-            let mut credentials = store.load().await.unwrap().unwrap();
-            credentials.client_id = client_id.into();
-            credentials.issuer = issuer.map(str::to_owned);
-            store.credentials.save(credentials).await.unwrap();
-        } else {
-            store.credentials.clear().await.unwrap();
-        }
-        drop(guard);
-
-        let error = tokio::time::timeout(std::time::Duration::from_secs(5), refresh)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(matches!(error, AuthError::AuthorizationRequired));
-        assert!(http_client.requests().is_empty());
-        assert!(store.refresh_lock.try_lock().is_ok());
-    }
-
-    #[rstest]
-    #[case::guard_failure(true)]
-    #[case::save_failure(false)]
-    #[tokio::test]
-    async fn refresh_store_failure_does_not_publish_new_state(#[case] fail_guard: bool) {
-        let mut store = coordinated_store().await;
-        store.fail_guard = fail_guard;
-        store.fail_save = !fail_guard;
-        let http_client = refresh_http_client();
-        let manager = coordinated_manager(store.clone(), Arc::new(http_client.clone())).await;
+    async fn guarded_refresh_rejects_credentials_for_another_client() {
+        let store = refresh_store();
+        let mut credentials = store.credentials.load().await.unwrap().unwrap();
+        credentials.client_id = "other-client".into();
+        store.credentials.save(credentials).await.unwrap();
+        let http_client = refresh_http_client(&store);
+        let manager = refresh_manager(store.clone(), http_client.clone()).await;
 
         assert!(matches!(
             manager.refresh_token().await,
-            Err(AuthError::InternalError(_))
+            Err(AuthError::AuthorizationRequired)
         ));
-        assert_eq!(http_client.requests().len(), usize::from(!fail_guard));
-        assert_eq!(*manager.current_scopes.read().await, ["stale"]);
-        let stored = store.load().await.unwrap().unwrap();
-        assert_eq!(stored.granted_scopes, ["read"]);
-        assert_eq!(
-            stored.token_response.unwrap().access_token().secret(),
-            "old-token"
-        );
-        assert!(store.refresh_lock.try_lock().is_ok());
+        assert!(http_client.recording.requests().is_empty());
+        assert!(store.lock.try_lock().is_ok());
     }
 
     #[rstest]
-    #[case::known_scopes(true)]
-    #[case::unknown_scopes(false)]
+    #[case("guard", 0)]
+    #[case("load", 0)]
+    #[case("save", 1)]
     #[tokio::test]
-    async fn refresh_preserves_omitted_fields_from_the_authoritative_record(
-        #[case] known_scopes: bool,
+    async fn refresh_store_failures_release_the_guard(
+        #[case] phase: &'static str,
+        #[case] provider_requests: usize,
     ) {
-        let store = coordinated_store().await;
-        if !known_scopes {
-            let mut credentials = store.load().await.unwrap().unwrap();
-            credentials.granted_scopes.clear();
-            store.credentials.save(credentials).await.unwrap();
-        }
-        let http_client = RecordingOAuthHttpClient::with_responses(vec![http_response(
-            200,
-            serde_json::json!({
-                "access_token": "new-token", "token_type": "Bearer", "expires_in": 3600,
-            }),
-        )]);
-        let manager = coordinated_manager(store.clone(), Arc::new(http_client)).await;
-        let refreshed = manager.refresh_token().await.unwrap();
-
-        assert_eq!(refreshed.refresh_token().unwrap().secret(), "old-refresh");
-        let expected_scopes = if known_scopes { vec!["read"] } else { vec![] };
-        assert_eq!(
-            refreshed.scopes().map(|scopes| scopes
-                .iter()
-                .map(|scope| scope.as_str())
-                .collect::<Vec<_>>()),
-            known_scopes.then_some(vec!["read"])
-        );
-        let saved = store.load().await.unwrap().unwrap();
-        assert_eq!(saved.token_response.unwrap().scopes(), refreshed.scopes());
-        assert_eq!(saved.granted_scopes, expected_scopes);
-        assert_eq!(*manager.current_scopes.read().await, expected_scopes);
-    }
-
-    struct GatedOAuthHttpClient {
-        client: RecordingOAuthHttpClient,
-        started: Arc<tokio::sync::Semaphore>,
-        response_gate: Arc<tokio::sync::Semaphore>,
-    }
-
-    impl OAuthHttpClient for GatedOAuthHttpClient {
-        fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
-            let response = self.client.execute(request);
-            Box::pin(async move {
-                self.started.add_permits(1);
-                self.response_gate.acquire().await.unwrap().forget();
-                response.await
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn default_auth_client_cancels_refresh_with_its_caller() {
-        let store = coordinated_store().await.credentials;
-        let http_client = Arc::new(GatedOAuthHttpClient {
-            client: refresh_http_client(),
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            response_gate: Arc::new(tokio::sync::Semaphore::new(0)),
-        });
+        let mut store = refresh_store();
+        store.fail_at = Some(phase);
+        let http_client = refresh_http_client(&store);
         let manager = refresh_manager(store.clone(), http_client.clone()).await;
-        let client = AuthClient::new((), manager);
-        let caller_client = client.clone();
-        let caller = tokio::spawn(async move { caller_client.get_access_token().await });
-        wait_for_permits(&http_client.started, 1).await;
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
 
-        // The caller owned the token operation, so its manager guard is released
-        // without allowing the blocked provider response to finish.
-        assert!(client.auth_manager.try_lock().is_ok());
-        let saved = store.load().await.unwrap().unwrap();
+        assert!(matches!(manager.refresh_token().await,
+            Err(AuthError::CredentialStoreError(message)) if message == format!("{phase} failed")));
+        assert_eq!(http_client.recording.requests().len(), provider_requests);
+        let saved = store.credentials.load().await.unwrap().unwrap();
         assert_eq!(
-            saved.token_response.unwrap().access_token().secret(),
-            "old-token"
+            saved
+                .token_response
+                .unwrap()
+                .refresh_token()
+                .unwrap()
+                .secret(),
+            "old-refresh"
         );
-        assert_eq!(http_client.client.requests().len(), 1);
-    }
-
-    #[rstest]
-    #[case::expiry_during_exchange(false, false)]
-    #[case::expiry_during_save(false, true)]
-    #[case::rejection_during_exchange(true, false)]
-    #[case::rejection_during_save(true, true)]
-    #[tokio::test]
-    async fn auth_client_finishes_refresh_after_caller_cancellation(
-        #[case] reactive: bool,
-        #[case] during_save: bool,
-    ) {
-        let mut store = coordinated_store().await;
-        let save_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        store.save_gate = Some(save_gate.clone());
-        let http_client = Arc::new(GatedOAuthHttpClient {
-            client: refresh_http_client(),
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            response_gate: Arc::new(tokio::sync::Semaphore::new(0)),
-        });
-        let manager = coordinated_manager(store.clone(), http_client.clone()).await;
-        let client = AuthClient::new((), manager);
-        let caller_client = client.clone();
-        let caller = tokio::spawn(async move {
-            if reactive {
-                caller_client
-                    .access_token_for(Some("old-token".into()))
-                    .await
-            } else {
-                caller_client.get_access_token().await
-            }
-        });
-        wait_for_permits(&http_client.started, 1).await;
-        if during_save {
-            http_client.response_gate.add_permits(1);
-            wait_for_permits(&store.save_started, 1).await;
-        }
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        assert!(store.refresh_lock.try_lock().is_err());
-        if !during_save {
-            http_client.response_gate.add_permits(1);
-            wait_for_permits(&store.save_started, 1).await;
-        }
-        save_gate.add_permits(1);
-        let manager = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.auth_manager.lock(),
-        )
-        .await
-        .unwrap();
-        let saved = store.load().await.unwrap().unwrap();
-        let token = saved.token_response.unwrap();
-        assert_eq!(token.access_token().secret(), "new-token");
-        assert_eq!(token.refresh_token().unwrap().secret(), "new-refresh");
-        assert_eq!(*manager.current_scopes.read().await, ["read"]);
-        assert_eq!(http_client.client.requests().len(), 1);
-        assert!(store.refresh_lock.try_lock().is_ok());
+        assert!(store.lock.try_lock().is_ok());
     }
 }

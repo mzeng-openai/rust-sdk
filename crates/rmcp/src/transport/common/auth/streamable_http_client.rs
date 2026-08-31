@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use http::{HeaderName, HeaderValue};
+use tracing::debug;
 
 use crate::transport::{
-    auth::{AuthClient, AuthError, OAuthRefreshMode},
+    auth::{AuthClient, AuthError},
     streamable_http_client::{StreamableHttpClient, StreamableHttpError},
 };
 
@@ -46,17 +47,16 @@ where
                 let Some(sent_token) = auth_token else {
                     return Err(StreamableHttpError::AuthRequired(challenge));
                 };
-                let refreshed = self.access_token_for(Some(sent_token.clone())).await;
+                let refreshed = {
+                    let manager = self.auth_manager.lock().await;
+                    manager.try_refresh_or_reauth().await
+                };
                 match refreshed {
                     Ok(fresh_token) if fresh_token != sent_token => call(Some(fresh_token)).await,
-                    Ok(_) | Err(AuthError::AuthorizationRequired) => {
-                        Err(StreamableHttpError::AuthRequired(challenge))
-                    }
-                    Err(error) if self.refresh_mode == OAuthRefreshMode::Coordinated => {
-                        Err(error.into())
-                    }
-                    Err(_) => {
-                        tracing::debug!("token refresh after server rejection failed");
+                    Ok(_) => Err(StreamableHttpError::AuthRequired(challenge)),
+                    Err(error @ AuthError::CredentialStoreError(_)) => Err(error.into()),
+                    Err(error) => {
+                        debug!("token refresh after server rejection failed: {error}");
                         Err(StreamableHttpError::AuthRequired(challenge))
                     }
                 }
@@ -215,117 +215,47 @@ mod tests {
     use super::*;
     use crate::transport::{
         auth::{
-            AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
+            AuthorizationManager, AuthorizationMetadata, CredentialRefreshGuard, CredentialStore,
             StoredCredentials,
         },
         streamable_http_client::AuthRequiredError,
     };
 
-    fn credentials(access_token: &str) -> StoredCredentials {
-        StoredCredentials::new(
-            "client".into(),
-            Some(
-                serde_json::from_value(serde_json::json!({
-                    "access_token": access_token,
-                    "token_type": "Bearer",
-                }))
-                .unwrap(),
-            ),
-            Vec::new(),
-            None,
-        )
+    struct UnavailableStore;
+
+    #[async_trait::async_trait]
+    impl CredentialStore for UnavailableStore {
+        async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+            unreachable!("guard failure must stop the credential load")
+        }
+
+        async fn save(&self, _: StoredCredentials) -> Result<(), AuthError> {
+            unreachable!("guard failure must stop the credential save")
+        }
+
+        async fn clear(&self) -> Result<(), AuthError> {
+            unreachable!("refresh must not clear credentials")
+        }
+
+        async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
+            Err(AuthError::CredentialStoreError("guard unavailable".into()))
+        }
     }
 
-    async fn auth_client(
-        store: impl CredentialStore + 'static,
-        mode: OAuthRefreshMode,
-    ) -> AuthClient<reqwest::Client> {
-        let mut manager = AuthorizationManager::new("http://localhost")
+    #[tokio::test]
+    async fn reactive_refresh_preserves_credential_store_failure() {
+        let mut manager = AuthorizationManager::new("https://mcp.example.com/mcp")
             .await
-            .unwrap()
-            .with_refresh_mode(mode);
+            .unwrap();
         manager.set_metadata(AuthorizationMetadata {
-            authorization_endpoint: "http://localhost/authorize".into(),
-            token_endpoint: "http://localhost/token".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
             ..Default::default()
         });
         manager.configure_client_id("client").unwrap();
-        manager.set_credential_store(store);
-        AuthClient::new(reqwest::Client::new(), manager)
-    }
+        manager.set_credential_store(UnavailableStore);
+        let client = AuthClient::new(reqwest::Client::new(), manager);
 
-    #[rstest::rstest]
-    #[case::legacy(OAuthRefreshMode::Legacy)]
-    #[case::coordinated(OAuthRefreshMode::Coordinated)]
-    #[tokio::test]
-    async fn delayed_unauthorized_response_uses_the_selected_refresh_mode(
-        #[case] mode: OAuthRefreshMode,
-    ) {
-        let store = InMemoryCredentialStore::new();
-        store.save(credentials("old-token")).await.unwrap();
-        let client = auth_client(store.clone(), mode).await;
-
-        let result = client
-            .call_reacting_to_challenges(None, |token| {
-                let store = store.clone();
-                async move {
-                    match token.as_deref() {
-                        Some("old-token") => {
-                            // Another request saves a fresh token before this
-                            // request's challenge reaches the authorization manager.
-                            store.save(credentials("new-token")).await.unwrap();
-                            Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                                "Bearer".into(),
-                            )))
-                        }
-                        Some("new-token") => Ok(()),
-                        unexpected => panic!("unexpected token: {unexpected:?}"),
-                    }
-                }
-            })
-            .await;
-        match mode {
-            OAuthRefreshMode::Legacy => {
-                assert!(matches!(result, Err(StreamableHttpError::AuthRequired(_))));
-            }
-            OAuthRefreshMode::Coordinated => result.unwrap(),
-        }
-    }
-
-    #[rstest::rstest]
-    #[case::legacy(OAuthRefreshMode::Legacy)]
-    #[case::coordinated(OAuthRefreshMode::Coordinated)]
-    #[tokio::test]
-    async fn reactive_refresh_errors_follow_the_refresh_mode(#[case] mode: OAuthRefreshMode) {
-        struct UnavailableGuardStore;
-
-        #[async_trait::async_trait]
-        impl CredentialStore for UnavailableGuardStore {
-            async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-                Err(AuthError::InternalError(
-                    "credential load unavailable".into(),
-                ))
-            }
-
-            async fn save(&self, _: StoredCredentials) -> Result<(), AuthError> {
-                unreachable!("guard failure must stop the credential save")
-            }
-
-            async fn clear(&self) -> Result<(), AuthError> {
-                unreachable!("refresh must not clear credentials")
-            }
-
-            async fn acquire_refresh_guard(
-                &self,
-            ) -> Result<Option<crate::transport::auth::CredentialRefreshGuard>, AuthError>
-            {
-                Err(AuthError::InternalError(
-                    "credential guard unavailable".into(),
-                ))
-            }
-        }
-
-        let client = auth_client(UnavailableGuardStore, mode).await;
         let error = client
             .call_reacting_to_challenges(Some("old-token".into()), |_| async {
                 Err::<(), _>(StreamableHttpError::AuthRequired(AuthRequiredError::new(
@@ -335,17 +265,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        match mode {
-            OAuthRefreshMode::Legacy => {
-                assert!(matches!(error, StreamableHttpError::AuthRequired(_)));
-            }
-            OAuthRefreshMode::Coordinated => {
-                assert!(matches!(
-                    error,
-                    StreamableHttpError::Auth(AuthError::InternalError(message))
-                        if message == "credential guard unavailable"
-                ));
-            }
-        }
+        assert!(matches!(error,
+            StreamableHttpError::Auth(AuthError::CredentialStoreError(message))
+                if message == "guard unavailable"));
     }
 }
