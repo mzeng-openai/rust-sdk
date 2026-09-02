@@ -293,6 +293,8 @@ pub trait CredentialStore: Send + Sync {
     /// The manager acquires this guard before loading credentials and retains it
     /// through the token request and save. `load` and `save` must not reacquire
     /// the same lock. Writers that bypass the guard are not serialized with it.
+    /// Proactive refreshes recheck token freshness after acquiring the guard;
+    /// explicit refreshes and retries after a 401 still request a new token.
     /// The default does not coordinate refreshes.
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
         Ok(None)
@@ -1067,6 +1069,11 @@ pub struct AuthorizationManager {
     /// OIDC Dynamic Client Registration `application_type` (SEP-837)
     application_type: Option<String>,
     allow_missing_issuer: bool,
+}
+
+enum RefreshMode {
+    Always,
+    IfExpired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2138,6 +2145,15 @@ impl AuthorizationManager {
     /// to avoid races between token retrieval and the actual HTTP request.
     const REFRESH_BUFFER_SECS: u64 = 30;
 
+    fn token_needs_refresh(token: &OAuthTokenResponse, received_at: Option<u64>) -> bool {
+        let (Some(expires_in), Some(received_at)) = (token.expires_in(), received_at) else {
+            // Preserve tokens whose expiry information is unavailable.
+            return false;
+        };
+        let elapsed = Self::now_epoch_secs().saturating_sub(received_at);
+        expires_in.as_secs().saturating_sub(elapsed) < Self::REFRESH_BUFFER_SECS
+    }
+
     /// Get access token from local credential store.
     /// If expired, refresh it automatically when a refresh token is available.
     /// When the access token has expired and no refresh token is available, or the
@@ -2154,19 +2170,11 @@ impl AuthorizationManager {
             return Err(AuthError::AuthorizationRequired);
         };
 
-        if let (Some(expires_in), Some(received_at)) =
-            (creds.expires_in(), stored_creds.token_received_at)
-        {
-            let elapsed = Self::now_epoch_secs().saturating_sub(received_at);
-            let remaining = expires_in.as_secs().saturating_sub(elapsed);
-
-            if remaining < Self::REFRESH_BUFFER_SECS {
-                tracing::info!(
-                    remaining_secs = remaining,
-                    "Access token expired or nearly expired, refreshing."
-                );
-                return self.try_refresh_or_reauth().await;
-            }
+        if Self::token_needs_refresh(creds, stored_creds.token_received_at) {
+            tracing::info!("Access token expired or nearly expired, refreshing.");
+            return Self::access_token_or_reauth(
+                self.refresh_token_inner(RefreshMode::IfExpired).await,
+            );
         }
 
         // When expiry info is unavailable (e.g., credentials stored before
@@ -2180,9 +2188,15 @@ impl AuthorizationManager {
     /// so the caller can re-prompt the user. Infrastructure errors (e.g. store
     /// I/O failures, misconfigured client) are propagated as-is.
     pub(crate) async fn try_refresh_or_reauth(&self) -> Result<String, AuthError> {
-        match self.refresh_token().await {
+        Self::access_token_or_reauth(self.refresh_token().await)
+    }
+
+    fn access_token_or_reauth(
+        result: Result<OAuthTokenResponse, AuthError>,
+    ) -> Result<String, AuthError> {
+        match result {
             Ok(new_creds) => {
-                tracing::info!("Refreshed access token.");
+                tracing::info!("Obtained access token.");
                 Ok(new_creds.access_token().secret().to_string())
             }
             Err(e @ (AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_))) => {
@@ -2195,6 +2209,13 @@ impl AuthorizationManager {
 
     /// refresh access token
     pub async fn refresh_token(&self) -> Result<OAuthTokenResponse, AuthError> {
+        self.refresh_token_inner(RefreshMode::Always).await
+    }
+
+    async fn refresh_token_inner(
+        &self,
+        mode: RefreshMode,
+    ) -> Result<OAuthTokenResponse, AuthError> {
         let oauth_client = self
             .oauth_client
             .as_ref()
@@ -2211,6 +2232,17 @@ impl AuthorizationManager {
         let current_credentials = stored_credentials
             .token_response
             .ok_or(AuthError::AuthorizationRequired)?;
+
+        if refresh_guard.is_some()
+            && matches!(mode, RefreshMode::IfExpired)
+            && !Self::token_needs_refresh(
+                &current_credentials,
+                stored_credentials.token_received_at,
+            )
+        {
+            *self.current_scopes.write().await = stored_credentials.granted_scopes;
+            return Ok(current_credentials);
+        }
 
         let refresh_token = current_credentials
             .refresh_token()
@@ -8495,28 +8527,56 @@ mod tests {
         assert!(store.lock.try_lock().is_ok());
     }
 
+    #[rstest]
+    #[case::forced(false)]
+    #[case::proactive(true)]
     #[tokio::test]
-    async fn concurrent_refreshes_wait_for_save_and_use_the_latest_token() {
+    async fn concurrent_refreshes_wait_for_save_and_use_the_latest_token(#[case] proactive: bool) {
         let mut store = refresh_store();
+        if proactive {
+            let mut credentials = store.credentials.load().await.unwrap().unwrap();
+            credentials.token_received_at = Some(AuthorizationManager::now_epoch_secs() - 7200);
+            store.credentials.save(credentials).await.unwrap();
+        }
         let save_gate = Arc::new(Semaphore::new(0));
         store.save_gate = Some(save_gate.clone());
         let http_client = refresh_http_client(&store);
         let first_manager = refresh_manager(store.clone(), http_client.clone()).await;
         let second_manager = refresh_manager(store.clone(), http_client.clone()).await;
 
-        let first = tokio::spawn(async move { first_manager.refresh_token().await });
+        let refresh = |manager: AuthorizationManager| async move {
+            let token = if proactive {
+                manager.get_access_token().await?
+            } else {
+                manager
+                    .refresh_token()
+                    .await?
+                    .access_token()
+                    .secret()
+                    .clone()
+            };
+            Ok::<_, AuthError>((token, manager.current_scopes.read().await.clone()))
+        };
+        let first = tokio::spawn(refresh(first_manager));
         wait_for_permits(&store.save_started, 1).await;
-        let second = tokio::spawn(async move { second_manager.refresh_token().await });
+        let second = tokio::spawn(refresh(second_manager));
         wait_for_permits(&store.guard_requested, 2).await;
         assert_eq!(http_client.recording.requests().len(), 1);
         assert!(store.lock.try_lock().is_err());
 
         save_gate.add_permits(2);
         let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap().unwrap().access_token().secret(), "new-token");
-        assert_eq!(
-            second.unwrap().unwrap().access_token().secret(),
+        let expected_second = if proactive {
+            "new-token"
+        } else {
             "latest-token"
+        };
+        assert_eq!(
+            [first.unwrap().unwrap(), second.unwrap().unwrap()],
+            [
+                ("new-token".to_string(), vec!["read".to_string()]),
+                (expected_second.to_string(), vec!["read".to_string()]),
+            ]
         );
         let refresh_tokens: Vec<String> = http_client
             .recording
@@ -8528,7 +8588,12 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        assert_eq!(refresh_tokens, ["old-refresh", "new-refresh"]);
+        let expected_refreshes = if proactive {
+            vec!["old-refresh"]
+        } else {
+            vec!["old-refresh", "new-refresh"]
+        };
+        assert_eq!(refresh_tokens, expected_refreshes);
         let saved = store.credentials.load().await.unwrap().unwrap();
         assert_eq!(
             saved
@@ -8537,7 +8602,11 @@ mod tests {
                 .refresh_token()
                 .unwrap()
                 .secret(),
-            "latest-refresh"
+            if proactive {
+                "new-refresh"
+            } else {
+                "latest-refresh"
+            }
         );
         assert!(store.lock.try_lock().is_ok());
     }
